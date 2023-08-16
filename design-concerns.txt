@@ -1,0 +1,177 @@
+Author: Angel He
+
+***********************
+Design considerations:
+
+1. Should the server accept calls from everyone, or just a subset of users?
+
+   - In reality, only a subset of users should be accepted - the RPC system 
+     may block malicious IP addresses, enforce username & password login, etc.
+
+
+2. Should authentication etc. be provided by the RPC framework, 
+   or by the functions that use the RPC framework?
+
+   Not done in this project, but both the RPC framework and functions 
+   should provide authentication in reality, to verify that they are 
+   communicating with who they expected.
+    - The RPC system could use, say, Diffie-Hellman key exchange, to allow 
+      both sides to communicate privately using a shared secret key.
+    - Some functions should probably be accessed by only a subset of users 
+      (e.g. read vs write permissions).
+   
+
+3. What transport layer protocol should be used? What are the trade-offs?
+
+   TCP should be used.
+    - Predominant trade-off on time & overhead vs. reliability & control.
+    - TCP provides reliable, in-order data transfer service, plus flow and 
+      congestion control, but UDP does not.
+    - However, UDP (connection-less) provides finer application control over 
+      what and when data is sent, less delay, and less header overhead.
+
+
+4. In which function(s) should the socket(s) be created?
+
+    - Client side: rpc_find()
+      This should be the first time when the client wants to connect to the 
+      server and send a request.
+    - Server side: rpc_init_server() and rpc_serve_all()
+       * rpc_init_server creates a listening socket.
+       * rpc_serve_all creates the actual connection sockets for sending and 
+         receiving data, as it accepts incoming requests.
+
+
+5. Should rpc_client and rpc_server be allocated dynamically or statically? 
+   What are the implications for the client and server code?
+
+   Dynamically for rpc_client, but probably statically for rpc_server.
+   - Implications are on whether they need to be freed.
+      * Client code has to explicitly call `rpc_close_client()`.
+      * But when and who should free the server?
+   - There's no need to free the server if it's allocated statically.
+     (i.e. Program ends, then server ends.)
+      * But server state info (e.g. array of RPC functions) also needs to be 
+        freed, unless allocated statically too / wanting to be retained.
+
+
+6. What happens if one host uses big-endian byte order and the other 
+   uses little-endian? How does that relate to “network byte order”?
+
+  - To transfer between the two hosts using different architectures, 
+    we need to convert data:
+     * from host to network byte order (big-endian), for transmission over 
+       the network (as per the conventions specified by Internet protocols).
+     * back to host machine byte order on recipient.
+  - Otherwise their exchanged data will cause confusions due to different 
+    byte-orderings.
+
+
+
+***********************
+
+My Application Layer Protocol: Explanation
+
+Overview:
+- 3 types of "prefix"es for requests from clients (indicates type of request):
+  1) FIND_REQ: rpc_find
+  2) CALL_REQ: rpc_call
+  3) CLOSE_REQ: rpc_close_client -> client wants to close the connection 
+     (no need to wait for server's response)
+- 2 types of server responses (indicates status of request):
+  1) SUCCESS_STAT: request was successful
+  2) FAILURE_STAT: request was unsuccessful.
+- A prefix is always sent before sending additional data.
+- These are used to distinguish whether to continue reading/writing more data.
+- Server closes the connection with a client if a CLOSE_REQ is received or 
+  there's no more data to read from that client.
+
+
+Typical scenarios:
+
+1) rpc_find:
+   - Only a SUCCESS_STAT response is followed by data.
+   - The length of the function's name is read first.
+   - Invalid function names are blocked.
+
+Success scenario:                         Failure scenario:
+Client           Server                 Client           Server
+  |                 |                     |                 |
+  |----FIND_REQ---->|                     |----FIND_REQ---->|
+  |                 |                     |                 |
+  |---name_length-->|                     |---name_length-->|
+  |                 |                     |                 |
+  |------name------>|                     |------name------>|
+  |                 |                     |                 |
+  |<--SUCCESS_STAT--|                     |<--FAILURE_STAT--|
+  |                 |                     |       ...       |
+  |<--handle_index--|                     |----CLOSE_REQ--->|
+  |       ...       |                     |                 |
+  |----CLOSE_REQ--->|
+  |                 |
+
+
+2) rpc_call:
+   To read the payload (rpc_data), data1 is read first, followed by 
+   data2_len, then data2.
+
+Success scenario:                         Failure scenario:
+Client           Server                Client           Server
+  |                 |                    |                 |
+  |----CALL_REQ---->|                    |----CALL_REQ---->|
+  |                 |                    |                 |
+  |--handle_index-->|                    |--handle_index-->|
+  |                 |                    |                 |
+  |------data------>|                    |------data------>|
+  |                 |                    |                 |
+  |<--SUCCESS_STAT--|                    |<--FAILURE_STAT--|
+  |                 |                    |       ...       |
+  |<----result------|                 
+  |       ...       |
+
+
+Additional rules:
+- data1 is no more than 64 bits
+- data2_len is limited to UINT32_MAX (2^32 - 1)
+- name:
+   * valid length range is [1, 2^16-1]
+   * only printable ASCII characters in the range [32, 126] are allowed.
+- The rpc_handle contains just an index of the function to be called, in 
+  the server's functions array. 
+   * This index is an unsigned 32-bit integer.
+   * So the implicit maximum number of functions that can be simultaneously 
+     registered (i.e. excluding overwritten ones) at the server is 2^32 - 1.
+   * Note: This simple structure is really unsafe! 
+     In reality MAC can be used, with that index being the message.
+
+
+Error responses:
+- For routine failures (e.g. procedure does not exist):
+  Server returns a FAILURE_STAT response.
+- A message is printed to stderr.
+- See rpc_safety.h for a list of errors classified in this RPC system.
+
+
+Other considerations:
+- IP layer packet loss and duplication: 
+  TCP provides reliable data transfer service.
+- IP packets have a maximum allowed size: 
+  If the packet is too big, the sender should just resend the data using a 
+  smaller IP datagram size. 
+  The `read_all()` and `write_all()` functions are also meant to handle cases 
+  of partial reads and writes.
+- Most I/O functions (mostly in the module `rpc_io_helper`) in this system have
+  3 types of return values:
+  1) SUCCESS (1), or the total number of bytes read/written -> Success
+  2) FAILED (-1) -> Some form of errors
+  3) EMPTY (0) -> A read() or write() returned 0 (usually, connection closed)
+
+
+Transport layer protocol used: TCP
+- Pros and cons of alternatives were mentioned in Q3 of the 'Answers' section.
+- Some additional comments:
+   * Running on top of TCP means that the application can delegate the 
+     handling of packet loss and duplication to this lower layer.
+   * The choice should also depend on the type of application - UDP would
+     be more suited to real-time services and network management applications.
+
