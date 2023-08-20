@@ -1,3 +1,3 @@
 To run the server program, type:
 
-./rpc-server -p <port> & ./rpc-client -i <ip-address> -p <port>
+./rpc-server -p &lt;port&gt; & ./rpc-client -i &lt;ip-address&gt; -p &lt;port&gt;
